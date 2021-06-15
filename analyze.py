@@ -184,8 +184,8 @@ class info_parser:
             print(' ')
             sim_rob = self.velocity_robustness()
             print('Enter filename (with path) for the hardware data file:')
-            # hardware_file = input()
-            hardware_file = 'data/latest.h5'
+            hardware_file = input()
+            # hardware_file = 'data/latest.h5'
             hard_rob = self.hardware_vel_rob(filename = hardware_file)
             fin_calc = abs(sim_rob - hard_rob)
             print('Calculated difference between robustness measures: %.4f'%fin_calc)
