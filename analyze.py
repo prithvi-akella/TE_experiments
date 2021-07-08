@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use('TKAgg', force = True)
 from matplotlib import colors as mcolors
 from matplotlib import rc, font_manager
+import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import pdb
 from mpac_cmd import *
@@ -76,8 +77,13 @@ class info_parser:
 
     def gen_gait_data(self, init_state = np.array([[0.2, 0.2, 0.1, 0.1]]), wait_time = 3.5, vis_flag = False):
         self.setup(show_output = vis_flag)
+        if vis_flag:
+            time.sleep(5)
         stand_idqp(h = init_state[0,0], rx = init_state[0,1], ry = init_state[0,2], rz = init_state[0,3])
-        time.sleep(1)
+        if vis_flag:
+            time.sleep(5)
+        else:
+            time.sleep(1)
         walk_mpc_idqp(h = 0.25, vx = 0.3)
         if vis_flag:
             time.sleep(10)
@@ -86,16 +92,24 @@ class info_parser:
         self.kill_process(self.process_list)
         pass
 
-    def gen_walk_data(self, wait_time = 3.5, vis_flag = False):
+    def gen_walk_data(self, wait_time = 2.5, vis_flag = False, velocity = 0.1, vel_interest = 0):
         self.setup(show_output = vis_flag)
-        walk_mpc_idqp(vx = 0.3)
+        time.sleep(1)
+        scale_factor = 0
+        # if velocity >= 0 and vel_interest == 0:
+        #     scale_factor = (velocity/0.3)*0.05
+        # elif vel_interest == 0:
+        #     scale_factor = (velocity/0.2)*0.075
+        velocities = [0,0,0]
+        velocities[vel_interest] = velocity + scale_factor
+        walk_mpc_idqp(vx = velocities[0], vy = velocities[1], vrz = velocities[2])
+        time.sleep(1.5)
+        velocities[vel_interest] = velocity
+        walk_mpc_idqp(vx = velocities[0], vy = velocities[1], vrz = velocities[2])
         if vis_flag:
             time.sleep(5)
         else:
             time.sleep(wait_time)
-        walk_mpc_idqp(vx = 0.3, vy = 0.3)
-        if vis_flag:
-            time.sleep(5)
         self.kill_process(self.process_list)
         pass
 
@@ -108,7 +122,7 @@ class info_parser:
         if visualizer: plt.rcParams.update({'font.size': 30})
         if visualizer: fig, ax = plt.subplots()
         ctrl_des = self.data[:]['ctrl_mode_des'].tolist()
-        init_index = ctrl_des.index(b'walk_mpc_idqp(0.25,0.30,0.00,0.0')
+        init_index = ctrl_des.index(b'walk_mpc_idqp(0.25,0.20,0.00,0.0')
         smoother = 200
         vx = self.data[init_index-smoother:]['qd'][:,0]
         et = self.data[init_index-smoother:]['epoch_time']
@@ -158,6 +172,122 @@ class info_parser:
         robustness = min((first_robustness, second_robustness))
         return robustness
 
+    def walking_robustness(self,des_vel = 0.1, vel_flag = 0, visualizer = False):
+        # Checks to see if the quadruped satisfied it's specification.
+        # vel_flag determines for which velocity the specification is to be
+        # evaluated.
+        #     vel_flag[0] = vx, vel_flag[1] = vy, vel_flag[2] = vrz
+        # Each different velocity has a different requirement, though in all cases
+        # the quadruped is to achieve it's desired velocity within 0.25 seconds of
+        # initially commanding the quadruped to move.
+        #     1) For vx: From 0.25-2.25 seconds, the quadruped is to maintain this
+        #         forward velocity and deviate about the desired velocity by no
+        #         more than epsilon = 0.5
+        #     2) For vy:  From 0.25-2.25 secods, the quadruped is to maintain this
+        #         velocity and deviate by nore more than 0.1
+        #     3) For vrz: From 0.25-2.25 seconds, the quadruped is to maintain this
+        #         desired velocity and deviate by no more than 0.05.
+        self.load_data()
+        ctrl_des = self.data[:]['ctrl_mode_curr'].tolist()
+        init_index = [idx for idx, s in enumerate(ctrl_des) if b'walk_mpc_idqp(' in s][0]
+        smoother = 50
+        tube_epsilons = [0.5,0.1,0.05]
+        overshoots = [0.3,0.2,0.4]
+        settle_times = [0.25, 0.25, 0.35]
+        settle_time = settle_times[vel_flag]
+        epsilon = tube_epsilons[vel_flag]
+        overshoot = overshoots[vel_flag]
+        velocity = self.data[init_index-smoother:]['qd'][:,vel_flag]
+        et = self.data[init_index-smoother:]['epoch_time']
+        n_samples = len(et)
+        smoothed_vel = [None for i in range(n_samples-smoother)]
+        smoothed_time = [None for i in range(n_samples-smoother)]
+        offset = sum(et[0:smoother])/smoother
+
+        for i in range(n_samples - smoother):
+            smoothed_vel[i] = sum(velocity[i:smoother+i])/smoother
+            smoothed_time[i] = sum(et[i:smoother+i])/smoother - offset
+
+        print('Determining starting/finishing times')
+        start_time_mark = self.find_first_index(smoothed_time, lambda x: x>=settle_time)
+        end_time_mark = self.find_first_index(smoothed_time, lambda x: x>=settle_time + 1)
+        if des_vel >= 0:
+            settling_robustness = self.determine_settling(vel = smoothed_vel,
+                time = smoothed_time, des_vel = des_vel, overshoot = overshoot,
+                req_time = settle_time)
+        else:
+            shuffled_vel = [-1*value for value in smoothed_vel]
+            settling_robustness = self.determine_settling(vel = shuffled_vel,
+                time = smoothed_time, des_vel = -1*des_vel, overshoot = overshoot,
+                req_time = settle_time)
+
+        maintain_rob1 = min(smoothed_vel[start_time_mark:end_time_mark]) - des_vel + epsilon
+        maintain_rob2 = des_vel + epsilon - max(smoothed_vel[start_time_mark:end_time_mark])
+        robustness = min((settling_robustness, maintain_rob1, maintain_rob2))
+
+        print('Robustness = %.4f'%robustness)
+        if visualizer:
+            plt.rcParams.update({'font.size': 30})
+            fig, ax = plt.subplots()
+            ax.plot(smoothed_time[:end_time_mark], smoothed_vel[:end_time_mark], color = 'black',lw = 4)
+            ax.plot(smoothed_time[start_time_mark:end_time_mark], des_vel*np.ones(end_time_mark-start_time_mark,),
+                color = 'green', ls = '--', lw = 2)
+            ax.hlines(y = des_vel + epsilon, xmin = smoothed_time[start_time_mark], xmax = smoothed_time[end_time_mark],
+                ls = '--', lw = 2, color = 'red')
+            ax.hlines(y = des_vel - epsilon, xmin = smoothed_time[start_time_mark], xmax = smoothed_time[end_time_mark],
+                ls = '--', lw = 2, color = 'red')
+            if des_vel >= 0:
+                min_bound = des_vel - epsilon
+                max_bound = max((des_vel + overshoot, des_vel + epsilon))
+            else:
+                min_bound = min((des_vel - overshoot, des_vel - epsilon))
+                max_bound = des_vel + epsilon
+            ax.vlines(smoothed_time[start_time_mark], min_bound, max_bound, color = 'red', lw = 2, ls = '--')
+            if des_vel >= 0:
+                ax.plot(smoothed_time[:start_time_mark],
+                    (des_vel+overshoot)*np.ones(start_time_mark,), color = 'blue', ls = '--', lw = 2)
+                ax.plot(smoothed_time[:start_time_mark],
+                    des_vel*np.ones(start_time_mark,), color = 'blue', ls = '--', lw = 2)
+            else:
+                ax.plot(smoothed_time[:start_time_mark],
+                    (des_vel-overshoot)*np.ones(start_time_mark,), color = 'blue', ls = '--', lw = 2)
+                ax.plot(smoothed_time[:start_time_mark],
+                    des_vel*np.ones(start_time_mark,), color = 'blue', ls = '--', lw = 2)
+            ax.set_xlabel('time (sec)', fontsize = 30)
+            ax.set_ylabel('v', rotation = 0, fontsize = 30)
+            ax.yaxis.set_label_coords(-0.075,0.45)
+            ax.set_title('Tracking Quadruped Forward Velocity', fontsize = 34)
+            mng = plt.get_current_fig_manager()
+            mng.resize(*mng.window.maxsize())
+            plt.show()
+        return robustness
+
+    def determine_settling(self, vel, time, des_vel, overshoot, req_time):
+        req_time_index = self.find_first_index(time, lambda x: x >= req_time)
+        if des_vel >= 0:
+            rob2 = lambda v, a, b: min([des_vel + overshoot - value for value in v[a:b]])
+            rob3 = lambda v, a, b: min([value - des_vel for value in v[a:b]])
+            print('Entered loop calculating output list')
+            output_list = [min((vel[i] - des_vel,
+                rob2(vel, i, req_time_index+1), rob3(vel, i, req_time_index+1)))
+                for i in range(req_time_index-1)]
+            return max(output_list)
+        else:
+            rob2 = lambda v, a, b: min([des_vel + overshoot - value for value in v[a:b]])
+            rob3 = lambda v, a, b: min([des_vel - value for value in v[a:b]])
+            print('Entered loop calculating output list')
+            output_list = [min((vel[i] - des_vel,
+                rob2(vel, i, req_time_index+1), rob3(vel, i, req_time_index+1)))
+                for i in range(req_time_index-1)]
+            return max(output_list)
+
+    def find_first_index(self, list, checker):
+        # Finds the first index in a list that outputs true when passed by checker
+        try:
+            output = next(x for x, val in enumerate(list) if checker(val))
+            return output
+        except:
+            return -1
 
     def find_worst_case(self):
         bounds = np.array([[0.2, 0.0, 0.0, 0.0],[0.25, 0.2, 0.2, 0.2]]).transpose()
@@ -172,6 +302,23 @@ class info_parser:
         optimizer.optimize()
         return optimizer
 
+    def find_worst_case_velocity(self, vel_interest = 0):
+        bound_list = [np.array([[-0.2],[0.3]]).transpose(), np.array([[-0.2],[0.2]]).transpose()]
+        bounds = bound_list[vel_interest]
+        def objective(x, vis_flag = False):
+            self.gen_walk_data(velocity = x[0,0], vel_interest = vel_interest)
+            return -self.walking_robustness(des_vel = x[0,0], vel_flag = vel_interest)
+
+
+        optimizer = UCBOptimizer(objective = objective, bounds = bounds, B = 1.2,
+            R = 0.2, delta = 1e-6, tolerance = 0.005, n_init_samples = 5,
+            length_scale = 1)
+
+        optimizer.initialize()
+        optimizer.optimize()
+        print('Function minimum value: %.4f'%-optimizer.UCB_val)
+        return optimizer
+
     def compare_systems(self):
         bounds = np.array([[0.2, 0.0, 0.0, 0.0],[0.25, 0.2, 0.2, 0.2]]).transpose()
         def objective(x):
@@ -184,8 +331,8 @@ class info_parser:
             print(' ')
             sim_rob = self.velocity_robustness()
             print('Enter filename (with path) for the hardware data file:')
-            hardware_file = input()
-            # hardware_file = 'data/latest.h5'
+            # hardware_file = input()
+            hardware_file = 'data/latest.h5'
             hard_rob = self.hardware_vel_rob(filename = hardware_file)
             fin_calc = abs(sim_rob - hard_rob)
             print('Calculated difference between robustness measures: %.4f'%fin_calc)
@@ -199,11 +346,87 @@ class info_parser:
         optimizer.optimize()
         return optimizer
 
+    def animate_data(self, filename = 'data/latest.h5', hardware = False):
+        self.load_data()
+        fig, ax = plt.subplots()
+        ctrl_des = self.data[:]['ctrl_mode_des'].tolist()
+        init_index = ctrl_des.index(b'walk_mpc_idqp(0.25,0.30,0.00,0.0')
+        smoother = 200
+        vx = self.data[init_index-smoother:]['qd'][:,0]
+        et = self.data[init_index-smoother:]['epoch_time']
+        n_samples = len(vx)
+        smoothed_vel = [None for i in range(n_samples-smoother)]
+        smoothed_time = [None for i in range(n_samples-smoother)]
+        offset = sum(et[0:smoother])/smoother
+        for i in range(n_samples - smoother):
+            smoothed_vel[i] = sum(vx[i:smoother+i])/smoother
+            smoothed_time[i] = sum(et[i:smoother+i])/smoother - offset
+        two_sec_mark = next(x for x,val in enumerate(smoothed_time) if val>=2)
+        three_sec_mark = next(x for x,val in enumerate(smoothed_time) if val>=3)
+        ax.plot(smoothed_time, 0.25*np.ones(n_samples-smoother,),
+            color = 'red', ls = '--', lw = 2)
+        ax.vlines(smoothed_time[two_sec_mark], 0, 0.35, color = 'red', lw = 2, ls = '--')
+        ax.vlines(smoothed_time[three_sec_mark], 0, 0.35, color = 'red', lw = 2, ls = '--')
+        ax.set_xlabel('time (sec)')
+        ax.set_ylabel('v', rotation = 0)
+        ax.yaxis.set_label_coords(-0.12,0.49)
+        ax.set_title('Tracking Quadruped Forward Velocity')
+
+        if hardware:
+            ax.plot(smoothed_time, smoothed_vel, lw = 3, color = 'black', label = 'sim')
+            self.load_data(filename)
+            ctrl_des = self.data[:]['ctrl_mode_des'].tolist()
+            init_index = ctrl_des.index(b'walk_mpc_idqp(0.25,0.30,0.00,0.0')
+            vx = self.data[init_index-smoother:]['qd'][:,0]
+            et = self.data[init_index-smoother:]['epoch_time']
+            n_samples = len(vx)
+            smoothed_vel = [None for i in range(n_samples-smoother)]
+            smoothed_time = [None for i in range(n_samples-smoother)]
+            offset = sum(et[0:smoother])/smoother
+            for i in range(n_samples - smoother):
+                smoothed_vel[i] = sum(vx[i:smoother+i])/smoother
+                smoothed_time[i] = sum(et[i:smoother+i])/smoother - offset
+            two_sec_mark = next(x for x,val in enumerate(smoothed_time) if val>=2)
+            three_sec_mark = next(x for x,val in enumerate(smoothed_time) if val>=3)
+            line, = ax.plot([],[],lw = 3, color = 'blue', label = 'hardware')
+            ax.legend(loc = 'best')
+        else:
+            line, = ax.plot([],[], lw = 3, color = 'black')
+
+        def animate(frame_number):
+            line.set_data(smoothed_time[:frame_number], smoothed_vel[:frame_number])
+            return line,
+
+
+        anim = animation.FuncAnimation(fig, animate, frames = len(smoothed_time), interval = 0.125, blit = False)
+        writervideo = animation.FFMpegWriter(fps=60)
+        if hardware:
+            anim.save('comparison.mp4',writer=writervideo)
+        else:
+            anim.save('velocity_smooth.mp4',writer=writervideo)
+
 
 
 if __name__ == '__main__':
     commander = info_parser()
-    # optimality = commander.find_worst_case()
-    # np.save('optimality/X_sample.npy',optimality.X_sample)
-    # np.save('optimality/Y_sample.npy',optimality.Y_sample)
-    optimality = commander.compare_systems()
+    optimizer = commander.find_worst_case_velocity(vel_interest = 0)
+    fig, ax = plt.subplots()
+    ax.scatter(optimizer.X_sample, -1*optimizer.Y_sample, marker = 'x', linewidth = 2, color = 'red')
+    steps = 100
+    xspace = np.linspace(-0.2,0.3,steps).tolist()
+    mean = [None for i in range(steps)]
+    ub = [None for i in range(steps)]
+    lb = [None for i in range(steps)]
+    for idx, x in enumerate(xspace):
+        xval = np.array([[x]])
+        mean[idx] = -1*optimizer.mu(xval)
+        lb[idx] = -1*(optimizer.mu(xval) + optimizer.beta*optimizer.sigma(xval))
+        ub[idx] = -1*(optimizer.mu(xval) - optimizer.beta*optimizer.sigma(xval))
+
+    ax.plot(xspace, mean, color = 'black', lw = 3)
+    ax.fill_between(xspace, lb, ub, color = 'blue', alpha = 0.5, lw = 3)
+    plt.show()
+
+    # vel = float(sys.argv[1])
+    # commander.gen_walk_data(velocity = vel, vel_interest = 0)
+    # commander.walking_robustness(des_vel = vel, vel_flag = 0, visualizer = True)
