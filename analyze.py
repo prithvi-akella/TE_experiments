@@ -346,6 +346,30 @@ class info_parser:
         optimizer.optimize()
         return optimizer
 
+    def compare_velocity(self, vel_interest = 0):
+        bound_list = [np.array([[-0.2],[0.3]]).transpose(), np.array([[-0.2],[0.2]]).transpose()]
+        bounds = bound_list[vel_interest]
+        def objective(x):
+            self.gen_walk_data(velocity = x[0,0], vel_interest = vel_interest)
+            sim_rob = self.walking_robustness(des_vel = x[0,0], vel_flag = vel_interest)
+            if vel_interest == 0:
+                print('Would like for the hardware system to command vx at: %.3f'%x[0,0])
+            else:
+                print('Would like for the hardware system to command vy at: %.3f'%x[0,0])
+            #### Insert command for hardware system
+            hard_rob = self.walking_robustness(des_vel = x[0,0], vel_flag = vel_interest)
+            fin_calc = abs(sim_rob - hard_rob)
+            print('Calculated difference between robustness measures: %.4f'%fin_calc)
+            print(' ')
+            return fin_calc
+
+        optimizer = UCBOptimizer(objective = objective, bounds = bounds, B = 0.1,
+            R = 0.05, delta = 1e-6, tolerance = 0.005, n_init_samples = 1)
+
+        optimizer.initialize()
+        optimizer.optimize()
+        return optimizer
+
     def animate_data(self, filename = 'data/latest.h5', hardware = False):
         self.load_data()
         fig, ax = plt.subplots()
@@ -426,7 +450,3 @@ if __name__ == '__main__':
     ax.plot(xspace, mean, color = 'black', lw = 3)
     ax.fill_between(xspace, lb, ub, color = 'blue', alpha = 0.5, lw = 3)
     plt.show()
-
-    # vel = float(sys.argv[1])
-    # commander.gen_walk_data(velocity = vel, vel_interest = 0)
-    # commander.walking_robustness(des_vel = vel, vel_flag = 0, visualizer = True)
