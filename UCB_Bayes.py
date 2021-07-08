@@ -9,7 +9,7 @@ import pdb
 
 class UCBOptimizer:
 	def __init__(self, objective, bounds, B, R=1, delta=0.05, n_restarts = 0,
-		n_init_samples = 5, tolerance = 0.05, length_scale = 1):
+		n_init_samples = 5, tolerance = 0.05, length_scale = 1, constraints = None):
 		# Objective here encodes the objective function to be optimized
 		# Bounds indicates the bounds over which objective is to be optimized.
 		# This algorithm will assume that the bounding region is hyper-rectangular
@@ -48,6 +48,15 @@ class UCBOptimizer:
 		# tolerance prescribes the required tolerance within which we would like the optimal value
 		# to lie
 
+		# length_scale: if the length_scale of the objective function is known apriori, then please input it
+		# (for use in an RBF kernel), else it will be initialized to 1 (for which the kernel is universal)
+
+		# constraint will be initialized to None unless otherwise populated.  We presume constraints is
+		# a list of constraint functions for the optimization problem at hand, each of which has the same
+		# evaluation scheme, i.e.: constraints[i](x) = some float.  Here, i is the i-th constraint, and
+		# x is a 1xN numpy array.  Additionally, we assume wlog that each constraint function is to be kept
+		# negative, i.e. the constraints are constraint[i](x) <= 0.
+
 		self.objective = objective
 		self.bounds = bounds
 		self.beta = []
@@ -67,13 +76,31 @@ class UCBOptimizer:
 		self.max_val = []
 		self.term_sigma = 0
 		self.UCB_sample_pt = 0
+		self.constraints = constraints
+
+	def check_constraints(self,x):
+		if self.constraints == None:
+			return True
+		else:
+			flag = True
+			for constraint in self.constraints:
+				flag = flag and (constraint(x) <=0)
+				if flag == False: break
+			return flag
 
 	def initialize(self, sample = None, observations = None, init_flag = False):
 		# Initialize a starting set of samples and their y-values.  Initial sample size is set to 5
 
 		if init_flag == False:
-			self.X_sample = np.random.uniform(self.bounds[:,0], self.bounds[:,1],
-				size=(self.n_init_samples,self.dimension))
+			sample_flag = False
+			while not sample_flag:
+				self.X_sample = np.random.uniform(self.bounds[:,0], self.bounds[:,1],
+					size=(self.n_init_samples,self.dimension))
+				met_constraints_flags = []
+				for i in range(self.n_init_samples):
+					met_constraints_flags.append(self.check_constraints(self.X_sample[i,:].reshape(1,-1)))
+				sample_flag = sample_flag or all(met_constraints_flags)
+
 			self.Y_sample = np.zeros((self.n_init_samples,1))
 			for i in range(self.n_init_samples):
 				self.Y_sample[i,0] = self.objective(self.X_sample[i,:].reshape(1,-1))
@@ -87,6 +114,8 @@ class UCBOptimizer:
 			observation_list = observations.reshape(-1,).tolist()
 			max_index = observation_list.index(max(observation_list))
 			self.best_sample = self.X_sample[max_index,:].reshape(1,-1)
+		else:
+			error('The initialization flag was set to False and a prior sample set was not provided')
 
 
 	def UCB(self, x):
@@ -94,7 +123,11 @@ class UCBOptimizer:
 		# gpr is the Regressed Gaussian Process defining the current mean and standard deviation.
 
 		# Returning the UCB based on the choice of beta.
-		return self.mu(x) + self.beta*self.sigma(x)
+		if self.check_constraints(x.reshape(1,-1)):
+			return self.mu(x) + self.beta*self.sigma(x)
+		else:
+
+			return -100
 
 	def propose_location(self, opt_restarts = 20):
 		# Propose the next location to sample (identify the sample point that maximizes the UCB)
@@ -110,7 +143,19 @@ class UCBOptimizer:
 
 		# Iterate through opt_restarts IP methods to determine the maximizer of the UCB over the
 		# hyper-rectangle identified by bounds.
-		for x0 in np.random.uniform(self.bounds[:, 0], self.bounds[:, 1], size=(opt_restarts, self.dimension)):
+		if self.constraints is not None:
+			x0_array = np.array([])
+			init_state_count = 0
+			while init_state_count <= opt_restarts:
+				sample = np.random.uniform(self.bounds[:,0], self.bounds[:,1], size = (1,self.dimension))
+				if self.check_constraints(sample):
+					x0_array = np.vstack((x0_array,sample)) if x0_array.shape[0]>0 else sample
+					init_state_count += 1
+		else:
+			x0_array = np.random.uniform(self.bounds[:, 0], self.bounds[:, 1], size=(opt_restarts, self.dimension))
+
+
+		for x0 in x0_array:
 			res = minimize(min_obj, x0 = x0, bounds = self.bounds, method='L-BFGS-B')
 			if res.fun < min_value:
 				min_value = res.fun
@@ -119,12 +164,36 @@ class UCBOptimizer:
 		# Output the minimizer (which is the maximizer of the UCB as we're minimizing -UCB)
 		return min_x.reshape(1,-1), min_value
 
+	def find_closest(self,x,indeces):
+		'''
+		Finds the nearest sample point in the sampled x array to the point x provided that also
+		satisfies the constraints
+		'''
+		length_list = [None for i in range(self.X_sample.shape[0])]
+		for i in range(self.X_sample.shape[0]):
+			length_list[i] = np.linalg.norm(self.X_sample[i,:].reshape(1,-1)-x)
+
+		if self.constraints is not None:
+			found_nearest = False
+			while not found_nearest:
+				minindex = length_list.index(min(length_list))
+				if minindex in indeces:
+					length_list[minindex] = max(length_list)
+				else:
+					found_nearest = True
+
+		distance = length_list[minindex]
+		return minindex,distance
+
+
 	def optimize(self):
 		# Initialize the nominal Matern Kernel (known to be universal for any parameters)
 		kernel = RBF(1.0)
 		self.kernel = kernel
 		F = 100
 		t = 1
+		missed_constraints = 0
+		indeces = []
 
 		while F >= self.tol:
 
@@ -139,19 +208,27 @@ class UCBOptimizer:
 			innersqrt = np.linalg.det((1+2/t)*np.identity(self.X_sample.shape[0]) + kernel(self.X_sample))
 			self.beta = self.B + self.R*math.sqrt(2*math.log(math.sqrt(innersqrt)/self.delta))
 			new_x, min_val = self.propose_location(opt_restarts = self.X_sample.shape[0]*2)
+			if not self.check_constraints(new_x):
+				pdb.set_trace()
 
 			F = 2*self.beta*self.sigma(new_x)
 			self.term_sigma = self.sigma(new_x)
 			new_y = self.objective(new_x)
+
 			self.UCB_sample_pt = new_x
 			self.UCB_val = -min_val
+
+			if not self.check_constraints(new_x):
+				missed_constraints += 1
+				indeces.append(self.X_sample.shape[0])
 
 			if new_y > self.cmax:
 				self.cmax = new_y
 				self.best_sample = new_x
 
-			self.X_sample = np.vstack((self.X_sample, new_x))
-			self.Y_sample = np.vstack((self.Y_sample, new_y))
+			if F >= self.tol:
+				self.X_sample = np.vstack((self.X_sample, new_x))
+				self.Y_sample = np.vstack((self.Y_sample, new_y))
 
 			print('Finshed with iteration %d'%t)
 			print('UCB value at that point: %.5f'%self.UCB_val)
@@ -165,3 +242,5 @@ class UCBOptimizer:
 		print('Assumed maximum value: %.3f'%(-min_val))
 		print('beta at termination: %.3f'%self.beta)
 		print('Final variance at termination: %.3f'%self.term_sigma)
+		print('Total number of times samples taken that did not satisfy constraints: %d'%missed_constraints)
+		print('Indeces in X_sample where the offending samples were taken {}'.format(indeces))
