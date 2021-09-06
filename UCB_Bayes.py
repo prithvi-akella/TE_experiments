@@ -117,7 +117,6 @@ class UCBOptimizer:
 		else:
 			error('The initialization flag was set to False and a prior sample set was not provided')
 
-
 	def UCB(self, x):
 		# Calculate the Upper Confidence Bound for a value, x, based on the data-set, (x_sample, y_sample).
 		# gpr is the Regressed Gaussian Process defining the current mean and standard deviation.
@@ -185,6 +184,19 @@ class UCBOptimizer:
 		distance = length_list[minindex]
 		return minindex,distance
 
+	def calc_musigma(self,kernel = RBF(1.0)):
+		Kn = kernel(self.X_sample)
+		t = self.X_sample.shape[0]
+		eta = 2/t
+		Kinv = np.linalg.inv(Kn+eta*np.identity(self.X_sample.shape[0]))
+		self.Kinv = Kinv
+		self.mu = lambda x: np.dot(np.dot(kernel(x.reshape(1,-1), self.X_sample).reshape(1,-1),
+			Kinv),self.Y_sample)[0,0]
+		self.sigma = lambda x: (kernel(x.reshape(1,-1)) - np.dot(np.dot(kernel(x.reshape(1,-1), self.X_sample).reshape(1,-1), Kinv),kernel(x.reshape(1,-1), self.X_sample).reshape(-1,1)))[0,0]
+
+		innersqrt = np.linalg.det((1+2/t)*np.identity(self.X_sample.shape[0]) + kernel(self.X_sample))
+		self.beta = self.B + self.R*math.sqrt(2*math.log(math.sqrt(innersqrt)/self.delta))
+		pass
 
 	def optimize(self):
 		# Initialize the nominal Matern Kernel (known to be universal for any parameters)
@@ -195,23 +207,12 @@ class UCBOptimizer:
 		missed_constraints = 0
 		indeces = []
 
+		self.calc_musigma(kernel = self.kernel)
+		new_x, min_val = self.propose_location(opt_restarts = self.X_sample.shape[0]*2)
+		F = 2*self.beta*self.sigma(new_x)
+
 		while F >= self.tol:
 
-			Kn = kernel(self.X_sample)
-			eta = 2/t
-			Kinv = np.linalg.inv(Kn+eta*np.identity(self.X_sample.shape[0]))
-			self.Kinv = Kinv
-			self.mu = lambda x: np.dot(np.dot(kernel(x.reshape(1,-1), self.X_sample).reshape(1,-1),
-				Kinv),self.Y_sample)[0,0]
-			self.sigma = lambda x: (kernel(x.reshape(1,-1)) - np.dot(np.dot(kernel(x.reshape(1,-1), self.X_sample).reshape(1,-1), Kinv),kernel(x.reshape(1,-1), self.X_sample).reshape(-1,1)))[0,0]
-
-			innersqrt = np.linalg.det((1+2/t)*np.identity(self.X_sample.shape[0]) + kernel(self.X_sample))
-			self.beta = self.B + self.R*math.sqrt(2*math.log(math.sqrt(innersqrt)/self.delta))
-			new_x, min_val = self.propose_location(opt_restarts = self.X_sample.shape[0]*2)
-			if not self.check_constraints(new_x):
-				pdb.set_trace()
-
-			F = 2*self.beta*self.sigma(new_x)
 			self.term_sigma = self.sigma(new_x)
 			new_y = self.objective(new_x)
 
@@ -226,9 +227,12 @@ class UCBOptimizer:
 				self.cmax = new_y
 				self.best_sample = new_x
 
-			if F >= self.tol:
-				self.X_sample = np.vstack((self.X_sample, new_x))
-				self.Y_sample = np.vstack((self.Y_sample, new_y))
+			self.X_sample = np.vstack((self.X_sample, new_x))
+			self.Y_sample = np.vstack((self.Y_sample, new_y))
+
+			self.calc_musigma(kernel = self.kernel)
+			new_x, min_val = self.propose_location(opt_restarts = self.X_sample.shape[0]*2)
+			F = 2*self.beta*self.sigma(new_x)
 
 			print('Finshed with iteration %d'%t)
 			print('UCB value at that point: %.5f'%self.UCB_val)
@@ -242,5 +246,31 @@ class UCBOptimizer:
 		print('Assumed maximum value: %.3f'%(-min_val))
 		print('beta at termination: %.3f'%self.beta)
 		print('Final variance at termination: %.3f'%self.term_sigma)
-		print('Total number of times samples taken that did not satisfy constraints: %d'%missed_constraints)
-		print('Indeces in X_sample where the offending samples were taken {}'.format(indeces))
+		if self.constraints is not None: print('Total number of times samples taken that did not satisfy constraints: %d'%missed_constraints)
+		if self.constraints is not None: print('Indeces in X_sample where the offending samples were taken {}'.format(indeces))
+
+		if self.bounds.shape[0] == 1:
+			self.xbase = np.linspace(self.bounds[0,0], self.bounds[0,1], 100).tolist()
+			self.mean_values = [None for i in range(100)]
+			self.ub = [None for i in range(100)]
+			self.lb = [None for i in range(100)]
+			for i in range(100):
+				xval = np.array([[self.xbase[i]]])
+				self.mean_values[i] = self.mu(np.array(xval))
+				self.ub[i] = self.mean_values[i] + self.beta*self.sigma(xval)
+				self.lb[i] = self.mean_values[i] - self.beta*self.sigma(xval)
+		elif self.bounds.shape[0] == 2:
+			x = np.linspace(self.bounds[0,0], self.bounds[0,1], 50)
+			y = np.linspace(self.bounds[1,0], self.bounds[1,1], 50)
+			X,Y = np.meshgrid(x,y)
+			self.Xbase = X
+			self.Ybase = Y
+			self.mean_values = np.zeros((50,50))
+			self.ub = np.zeros((50,50))
+			self.lb = np.zeros((50,50))
+			for i in range(50):
+				for j in range(50):
+					xval = np.array([[X[i,j], Y[i,j]]])
+					self.mean_values[i,j] = self.mu(xval)
+					self.ub[i,j] = self.mu(xval) + self.beta*self.sigma(xval)
+					self.lb[i,j] = self.mu(xval) - self.beta*self.sigma(xval)
